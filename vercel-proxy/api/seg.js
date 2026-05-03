@@ -7,17 +7,32 @@ export default async function handler(request) {
     return corsResp(new Response(null, { status: 204 }));
   }
 
+  // نقرأ الـ path الأصلي من header خاص بـ Vercel أو من الـ URL مباشرة
+  const originalPath = request.headers.get("x-matched-path") || url.pathname;
   const path = url.pathname;
-  if (path === "/seg" || path === "/api/seg") {
-    return handleSeg(request, url);
+
+  // ── الصفحة الرئيسية / health ──────────────────────────────────────────────
+  if (path === "/" || path === "/health" || path === "/api/seg" && !url.searchParams.get("v")) {
+    // إذا فيه v parameter يعني طلب seg حقيقي
+    if (path === "/api/seg" && url.searchParams.get("v")) {
+      return handleSeg(request, url);
+    }
+    return corsResp(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          proxy: "iptv-brander-vercel",
+          status: "running",
+          endpoints: { seg: "/seg?v=TOKEN", health: "/health" }
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    );
   }
 
-  if (path === "/health" || path === "/api/health") {
-    return corsResp(
-      new Response(JSON.stringify({ ok: true, proxy: "iptv-brander-vercel" }), {
-        headers: { "Content-Type": "application/json" },
-      })
-    );
+  // ── /seg أو /api/seg مع token ────────────────────────────────────────────
+  if (path === "/seg" || path === "/api/seg") {
+    return handleSeg(request, url);
   }
 
   return new Response("Not found", { status: 404 });
@@ -31,7 +46,7 @@ async function handleSeg(request, url) {
   const v = url.searchParams.get("v");
   if (!v) return proxyErr(400, "Missing token");
 
-  // ── Decrypt single AES-256-GCM blob → { u: originUrl, e: expiry } ──────────
+  // ── Decrypt AES-256-GCM blob → { u: originUrl, e: expiry } ────────────────
   let originUrl, exp;
   try {
     const raw   = base64urlDecode(v);
@@ -46,100 +61,80 @@ async function handleSeg(request, url) {
     return proxyErr(403, "Invalid or tampered token");
   }
 
-  // ── Check expiry ─────────────────────────────────────────────────────────────
-  if (!exp || exp < Math.floor(Date.now() / 1000)) {
+  if (!exp || exp < Math.floor(Date.now() / 1000))
     return proxyErr(403, "Token expired");
-  }
 
-  if (!originUrl || !originUrl.startsWith("http")) {
+  if (!originUrl || !originUrl.startsWith("http"))
     return proxyErr(400, "Invalid URL");
-  }
 
-  // ── Optional path suffix (DASH BaseURL templates) ────────────────────────────
   const pathSuffix = url.searchParams.get("p") || "";
-  if (pathSuffix) {
-    originUrl = originUrl.endsWith("/") ? originUrl + pathSuffix : originUrl + pathSuffix;
-  }
+  if (pathSuffix) originUrl = originUrl + pathSuffix;
 
-  // ── Forward request headers ──────────────────────────────────────────────────
+  // ── Forward headers ──────────────────────────────────────────────────────
   const fwdHeaders = new Headers();
   for (const h of ["User-Agent", "Range", "Accept", "Accept-Language", "Referer"]) {
     if (request.headers.has(h)) fwdHeaders.set(h, request.headers.get(h));
   }
-  if (!fwdHeaders.has("User-Agent")) {
+  if (!fwdHeaders.has("User-Agent"))
     fwdHeaders.set("User-Agent", "VLC/3.0.20 LibVLC/3.0.20");
-  }
 
-  // ── Fetch from origin ────────────────────────────────────────────────────────
+  // ── Fetch from origin ────────────────────────────────────────────────────
   let originRes;
   try {
-    originRes = await fetch(originUrl, {
-      headers: fwdHeaders,
-      redirect: "follow",
-    });
+    originRes = await fetch(originUrl, { headers: fwdHeaders, redirect: "follow" });
   } catch (e) {
     return proxyErr(502, "Origin unreachable: " + e.message);
   }
 
-  if (!originRes.ok && originRes.status !== 206) {
+  if (!originRes.ok && originRes.status !== 206)
     return proxyErr(originRes.status, "Origin returned " + originRes.status);
-  }
 
   const ct      = originRes.headers.get("Content-Type") || "";
   const urlPath = originUrl.toLowerCase().split("?")[0];
+  const isM3u8  = ct.toLowerCase().includes("mpegurl")
+               || urlPath.endsWith(".m3u8")
+               || urlPath.endsWith(".m3u");
 
-  // ── HLS playlist → rewrite segment URLs through this proxy ──────────────────
-  const isM3u8 = ct.toLowerCase().includes("mpegurl")
-              || urlPath.endsWith(".m3u8")
-              || urlPath.endsWith(".m3u");
-
+  // ── M3U8: rewrite segment URLs ───────────────────────────────────────────
   if (isM3u8) {
     const text      = await originRes.text();
     const segExp    = Math.min(exp, Math.floor(Date.now() / 1000) + 30);
     const proxyBase = new URL(request.url).origin;
     const rewritten = await rewriteM3u8(text, originUrl, proxyBase, SECRET, segExp);
-    return corsResp(
-      new Response(rewritten, {
-        status: 200,
-        headers: {
-          "Content-Type":  "application/vnd.apple.mpegurl",
-          "Cache-Control": "no-cache, no-store",
-        },
-      })
-    );
+    return corsResp(new Response(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type":  "application/vnd.apple.mpegurl",
+        "Cache-Control": "no-cache, no-store",
+      },
+    }));
   }
 
-  // ── All binary content (TS, M4S, AAC, MP4, KEY, etc.) → stream through ──────
+  // ── Binary (TS / AAC / MP4): stream through ──────────────────────────────
   const respHeaders = new Headers({ "Cache-Control": "no-cache, no-store" });
   for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]) {
     if (originRes.headers.has(h)) respHeaders.set(h, originRes.headers.get(h));
   }
-
   const originCt = (respHeaders.get("Content-Type") || "").toLowerCase();
   const isTsUrl  = urlPath.endsWith(".ts") || urlPath.endsWith(".mts")
     || /\/live\/[^/]+\/[^/]+\/\d+$/.test(urlPath);
 
-  if (urlPath.endsWith(".ts") || urlPath.endsWith(".mts") || (isTsUrl && originCt === "application/octet-stream")) {
-    respHeaders.set("Content-Type", "video/mp2t");
-  } else if (!respHeaders.has("Content-Type") || originCt === "application/octet-stream") {
-    if (urlPath.endsWith(".aac"))                                   respHeaders.set("Content-Type", "audio/aac");
-    else if (urlPath.endsWith(".m4s") || urlPath.endsWith(".mp4")) respHeaders.set("Content-Type", "video/mp4");
-    else if (isTsUrl)                                               respHeaders.set("Content-Type", "video/mp2t");
-    else                                                            respHeaders.set("Content-Type", "video/mp2t");
+  if (!respHeaders.has("Content-Type") || originCt === "application/octet-stream") {
+    if      (urlPath.endsWith(".aac"))                                   respHeaders.set("Content-Type", "audio/aac");
+    else if (urlPath.endsWith(".m4s") || urlPath.endsWith(".mp4"))       respHeaders.set("Content-Type", "video/mp4");
+    else                                                                  respHeaders.set("Content-Type", "video/mp2t");
   }
   if (!respHeaders.has("Accept-Ranges")) respHeaders.set("Accept-Ranges", "bytes");
 
-  return corsResp(
-    new Response(originRes.body, {
-      status:  originRes.status,
-      headers: respHeaders,
-    })
-  );
+  return corsResp(new Response(originRes.body, {
+    status:  originRes.status,
+    headers: respHeaders,
+  }));
 }
 
 
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
-async function rewriteM3u8(content, originUrl, proxyOrigin, secret, segExp) {
+async function rewriteM3u8(content, originUrl, proxyBase, secret, segExp) {
   const parsed  = new URL(originUrl);
   const baseUrl = originUrl.substring(0, originUrl.lastIndexOf("/") + 1);
 
@@ -149,29 +144,17 @@ async function rewriteM3u8(content, originUrl, proxyOrigin, secret, segExp) {
       if (!trimmed || trimmed.startsWith("#")) return line;
 
       let segUrl;
-      if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-        segUrl = trimmed;
-      } else if (trimmed.startsWith("//")) {
-        segUrl = parsed.protocol + trimmed;
-      } else if (trimmed.startsWith("/")) {
-        segUrl = parsed.origin + trimmed;
-      } else {
-        segUrl = baseUrl + trimmed;
-      }
+      if      (trimmed.startsWith("http://") || trimmed.startsWith("https://")) segUrl = trimmed;
+      else if (trimmed.startsWith("//"))  segUrl = parsed.protocol + trimmed;
+      else if (trimmed.startsWith("/"))   segUrl = parsed.origin + trimmed;
+      else                                segUrl = baseUrl + trimmed;
 
-      return await makeProxyUrl(proxyOrigin, segUrl, segExp, secret);
+      const payload = JSON.stringify({ u: segUrl, e: segExp });
+      const v       = await encryptPayload(payload, secret);
+      return `${proxyBase}/seg?v=${v}`;
     })
   );
-
   return lines.join("\n");
-}
-
-
-// ── Build a single-token proxy URL ────────────────────────────────────────────
-async function makeProxyUrl(proxyOrigin, url, exp, secret) {
-  const payload = JSON.stringify({ u: url, e: exp });
-  const v       = await encryptPayload(payload, secret);
-  return `${proxyOrigin}/seg?v=${v}`;
 }
 
 
@@ -217,10 +200,8 @@ function corsResp(resp) {
 }
 
 function proxyErr(status, msg) {
-  return corsResp(
-    new Response(msg, {
-      status,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    })
-  );
-                               }
+  return corsResp(new Response(msg, {
+    status,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  }));
+    }
